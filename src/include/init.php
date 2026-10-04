@@ -238,6 +238,7 @@ static $default_config = [
 	'OIDC_CLIENT_MATCH_EMAIL' => true,
 	'OIDC_CLIENT_DEFAULT_PERMISSIONS' => null,
 	'OIDC_CLIENT_CALLBACK'  => null,
+	'OIDC_REMEMBER_JWT_DAYS' => 30,
 	'ENABLE_PERMISSIONS'    => true,
 	'LEGAL_HOSTING_DETAILS' => null,
 	'ALERT_MESSAGE'         => null,

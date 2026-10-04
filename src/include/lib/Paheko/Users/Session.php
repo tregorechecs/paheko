@@ -32,7 +32,8 @@ use const Paheko\{
 	OIDC_CLIENT_SECRET,
 	OIDC_CLIENT_MATCH_EMAIL,
 	OIDC_CLIENT_DEFAULT_PERMISSIONS,
-	OIDC_CLIENT_CALLBACK
+	OIDC_CLIENT_CALLBACK,
+	OIDC_REMEMBER_JWT_DAYS
 };
 
 use KD2\Security;
@@ -77,6 +78,7 @@ class Session extends \KD2\UserSession
 	protected $cookie_name = 'pko';
 	protected $remember_me_cookie_name = 'pkop';
 	protected $remember_me_expiry = '+3 months';
+	protected string $oidc_remember_cookie_name = 'remember_me';
 
 	protected ?array $_permissions = null;
 	protected ?array $_files_permissions = null;
@@ -195,9 +197,10 @@ class Session extends \KD2\UserSession
 
 			// Update login date as well
 			$this->db->preparedQuery('UPDATE users SET date_login = ? WHERE id = ?;', [new \DateTime, $user_id]);
+			return true;
 		}
 
-		return $r;
+		return $this->oidcJwtAutoLogin();
 	}
 
 	protected function storeRememberMeSelector($selector, $hash, $expiry, $user_id)
@@ -415,15 +418,18 @@ class Session extends \KD2\UserSession
 			'user' => ['_name' => $info->profile->name ?? ($info->email ?? '')]
 		];
 
+		$oidc_email = null;
+
 		if (OIDC_CLIENT_MATCH_EMAIL) {
 			if (empty($info->email)) {
 				throw new UserException('Le fournisseur OpenID Connect n\'a pas fourni d\'adresse e-mail dans sa réponse.');
 			}
 
-			$user = Users::getFromLogin($info->email);
+			$oidc_email = (string) $info->email;
+			$user = Users::getFromLogin($oidc_email);
 
 			if (!$user) {
-				throw new UserException('Aucun membre trouvé avec l\'adresse e-mail fournie : ' . $info->email);
+				throw new UserException('Aucun membre trouvé avec l\'adresse e-mail fournie : ' . $oidc_email);
 			}
 
 			$user = $user->id();
@@ -443,6 +449,10 @@ class Session extends \KD2\UserSession
 			if (is_object($r) && ($r instanceof User) && $r !== $this->user()) {
 				$this->setUser($r);
 			}
+		}
+
+		if ($oidc_email) {
+			$this->setOidcRememberJwtCookie($oidc_email);
 		}
 	}
 
@@ -468,8 +478,145 @@ class Session extends \KD2\UserSession
 		$this->user = null;
 		$this->_permissions = null;
 		$this->_files_permissions = null;
+		$this->clearOidcRememberJwtCookie();
 
 		return parent::logout();
+	}
+
+	/**
+	 * Auto-login from OIDC remember_me JWT cookie (TicketChess-style, 30 days).
+	 */
+	protected function oidcJwtAutoLogin(): bool
+	{
+		if (!OIDC_CLIENT_URL) {
+			return false;
+		}
+
+		$email = $this->getOidcRememberJwtEmail();
+
+		if (!$email) {
+			return false;
+		}
+
+		$login_user = $this->getUserForLogin($email);
+
+		if (!$login_user) {
+			$this->clearOidcRememberJwtCookie();
+			return false;
+		}
+
+		if (!$this->create((int) $login_user->id)) {
+			$this->clearOidcRememberJwtCookie();
+			return false;
+		}
+
+		$user_id = $this->getUser()->id;
+		Plugins::fire('user.login.auto', false, compact('user_id'));
+		$this->db->preparedQuery('UPDATE users SET date_login = ? WHERE id = ?;', [new \DateTime, $user_id]);
+
+		return true;
+	}
+
+	protected function setOidcRememberJwtCookie(string $email): void
+	{
+		$days = max(1, (int) OIDC_REMEMBER_JWT_DAYS);
+		$expires = time() + ($days * 86400);
+		$jwt = $this->createOidcRememberJwt($email, $expires);
+
+		setcookie($this->oidc_remember_cookie_name, $jwt, $this->oidcRememberCookieOptions($expires));
+		$_COOKIE[$this->oidc_remember_cookie_name] = $jwt;
+	}
+
+	protected function clearOidcRememberJwtCookie(): void
+	{
+		setcookie($this->oidc_remember_cookie_name, '', $this->oidcRememberCookieOptions(time() - 3600));
+		unset($_COOKIE[$this->oidc_remember_cookie_name]);
+	}
+
+	protected function oidcRememberCookieOptions(int $expires): array
+	{
+		$url = parse_url(ADMIN_URL);
+
+		return [
+			'expires' => $expires,
+			'path' => preg_replace('!/admin/$!', '/', $url['path'] ?? '/') ?: '/',
+			'secure' => HTTP::getScheme() == 'https',
+			'httponly' => true,
+			'samesite' => 'Lax',
+		];
+	}
+
+	protected function createOidcRememberJwt(string $email, int $expires): string
+	{
+		$header = $this->base64UrlEncode(json_encode(['alg' => 'HS256', 'typ' => 'JWT'], JSON_THROW_ON_ERROR));
+		$payload = $this->base64UrlEncode(json_encode([
+			'sub' => $email,
+			'iat' => time(),
+			'exp' => $expires,
+		], JSON_THROW_ON_ERROR));
+		$signature = $this->base64UrlEncode(
+			hash_hmac('sha256', $header . '.' . $payload, LOCAL_SECRET_KEY, true)
+		);
+
+		return $header . '.' . $payload . '.' . $signature;
+	}
+
+	protected function getOidcRememberJwtEmail(): ?string
+	{
+		$jwt = $_COOKIE[$this->oidc_remember_cookie_name] ?? null;
+
+		if (!is_string($jwt) || $jwt === '') {
+			return null;
+		}
+
+		$parts = explode('.', $jwt);
+
+		if (count($parts) !== 3) {
+			return null;
+		}
+
+		[$header_b64, $payload_b64, $signature_b64] = $parts;
+		$expected = $this->base64UrlEncode(
+			hash_hmac('sha256', $header_b64 . '.' . $payload_b64, LOCAL_SECRET_KEY, true)
+		);
+
+		if (!hash_equals($expected, $signature_b64)) {
+			return null;
+		}
+
+		$payload_json = $this->base64UrlDecode($payload_b64);
+
+		if ($payload_json === null) {
+			return null;
+		}
+
+		try {
+			$payload = json_decode($payload_json, false, 512, JSON_THROW_ON_ERROR);
+		}
+		catch (\JsonException $e) {
+			return null;
+		}
+
+		if (!is_object($payload)
+			|| empty($payload->sub)
+			|| !is_string($payload->sub)
+			|| empty($payload->exp)
+			|| (int) $payload->exp < time()) {
+			return null;
+		}
+
+		return trim($payload->sub) ?: null;
+	}
+
+	protected function base64UrlEncode(string $data): string
+	{
+		return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+	}
+
+	protected function base64UrlDecode(string $data): ?string
+	{
+		$decoded = base64_decode(strtr($data, '-_', '+/'), true);
+		return $decoded === false ? null : $decoded;
 	}
 
 	public function recoverPasswordSend(string $login): void
