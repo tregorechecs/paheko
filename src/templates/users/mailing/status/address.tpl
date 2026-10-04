@@ -15,7 +15,8 @@
 			{tag label="Adressee vérifiée" color="darkgreen"}<br />
 			<span class="help">Cette adresse a été vérifiée par l'envoi d'un message au destinataire contenant un lien à cliquer.</span>
 		{else}
-			{tag label="Adresse non vérifiée"}
+			{*tag label="Adresse non vérifiée"*}
+			aucun
 		{/if}
 	</dd>
 	{if !$email->canSend()}
@@ -37,7 +38,7 @@
 	<dd>{$email.fail_count}</dd>
 	<dt>Dernier message envoyé</dt>
 	<dd>{if $email.last_sent}{$email.last_sent|date_short:true}{else}<em>(Aucun historique)</em>{/if}</dd>
-	<dt>Préférences d'envoi</dt>
+	<dt>Préférences de réception</dt>
 	<dd>
 		{if $email.accepts_messages}{icon shape="check"}{else}{icon shape="uncheck"}{/if} Messages personnels<br />
 		{if $email.accepts_reminders}{icon shape="check"}{else}{icon shape="uncheck"}{/if} Rappels de cotisation et d'activité<br />

@@ -46,7 +46,9 @@
 				<td class="money">{$line.change|abs|raw|money}</td>
 				<td>{$line.reference}</td>
 				<th scope="row">{$line.label}</th>
+				{if $list->hasColumn('line_reference')}
 				<td>{$line.line_reference}</td>
+				{/if}
 				<td class="num">{foreach from=$line.project_code item="code" key="id"}<a href="{$admin_url}acc/reports/statement.php?project={$id}&amp;year={$year.id}">{$code}</a> {/foreach}</td>
 				{if isset($line.locked)}
 				<td>{if $line.locked}{icon title="Écriture verrouillée" shape="lock"}{/if}</td>
@@ -54,7 +56,7 @@
 				<td class="num">{if $line.files}{$line.files}{/if}</td>
 				{if property_exists($line, 'status_label')}
 				<td>
-					{if $line.status & Entities\Accounting\Transaction::STATUS_WAITING && $line.status_label}
+					{if $line.status_label == 'En attente'}
 						{tag color="darkred" label=$line.status_label}
 					{elseif $line.status_label}
 						{tag color="DarkSeaGreen" label=$line.status_label}
@@ -62,10 +64,10 @@
 				</td>
 				{/if}
 				<td class="actions">
-					{if $line.type == Transaction::TYPE_DEBT && ($line.status & Transaction::STATUS_WAITING)}
+					{if $line.payoff_kind == Transaction::TYPE_DEBT && (($line.type == Transaction::TYPE_ADVANCED && !($line.status & Transaction::STATUS_PAID)) || ($line.status & Transaction::STATUS_WAITING))}
 						{assign var="has_debt_or_credit" value=true}
 						{linkbutton shape="check" label="Régler cette dette" href="!acc/transactions/new.php?payoff=%d"|args:$line.id}
-					{elseif $line.type == Transaction::TYPE_CREDIT && ($line.status & Transaction::STATUS_WAITING)}
+					{elseif $line.payoff_kind == Transaction::TYPE_CREDIT && (($line.type == Transaction::TYPE_ADVANCED && !($line.status & Transaction::STATUS_PAID)) || ($line.status & Transaction::STATUS_WAITING))}
 						{assign var="has_debt_or_credit" value=true}
 						{linkbutton shape="export" label="Régler cette créance" href="!acc/transactions/new.php?payoff=%d"|args:$line.id}
 					{/if}

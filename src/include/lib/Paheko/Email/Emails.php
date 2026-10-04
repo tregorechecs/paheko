@@ -17,19 +17,20 @@ use Paheko\Web\Render\Render;
 
 use Paheko\Files\Files;
 
-use const Paheko\{USE_CRON, MAIL_SENDER, MAIL_RETURN_PATH, DISABLE_EMAIL, WWW_URL, ADMIN_URL, SECRET_KEY};
-use const Paheko\{SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_SECURITY, SMTP_HELO_HOSTNAME};
+use const Paheko\{USE_CRON, MAIL_SENDER, MAIL_RETURN_PATH, DISABLE_EMAIL, WWW_URL, ADMIN_URL, SECRET_KEY, MAIL_TEST_RECIPIENTS};
+use const Paheko\{SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_SECURITY, SMTP_HELO_HOSTNAME, SMTP_MAX_MESSAGES_PER_SESSION};
 
 use KD2\SMTP;
 use KD2\SMTP_Exception;
 use KD2\Security;
 use KD2\Mail_Message;
 use KD2\DB\EntityManager as EM;
+use KD2\HTML\CSSParser;
 
 class Emails
 {
 	const RENDER_FORMATS = [
-		null => 'Texte brut',
+		'' => 'Texte brut',
 		Render::FORMAT_MARKDOWN => 'MarkDown',
 	];
 
@@ -48,6 +49,64 @@ class Emails
 	const FAIL_LIMIT = 5;
 
 	/**
+	 * This will wrap the message HTML contents inside
+	 * the main email template, parse the CSS, and apply all
+	 * the CSS rules in the 'style' attribute of each tag.
+	 * Then the style tag is deleted.
+	 * If the CSS parsing fails, the style tag is left as-is.
+	 */
+	static public function applyHTMLTemplate(string $inner_html)
+	{
+		static $template = null;
+		static $css_parser = null;
+
+		$template ??= new UserTemplate('web/email.html');
+
+		$template->assign('html', $inner_html);
+		$html = $template->fetch();
+
+		// If CSS parser is FALSE, this means the parsing of the CSS file failed
+		// then don't try to apply CSS, unless we want to make sure the style
+		if ($css_parser !== false) {
+			libxml_use_internal_errors(true);
+			$doc = new \DOMDocument;
+			$doc->loadHTML($html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+
+			// Parse CSS style only once
+			if (null === $css_parser) {
+				try {
+					$css_parser = new CSSParser;
+					$style_tag = $css_parser->xpath($doc, '//style', 0);
+					$css_parser->import($style_tag->textContent);
+				}
+				catch (\InvalidArgumentException $e) {
+					$css_parser = false;
+					unset($doc);
+					libxml_use_internal_errors(false);
+
+					return $html;
+				}
+			}
+
+			// Then apply CSS styles to each tag, by adding a 'style' attribute
+			$css_parser->style($doc->documentElement);
+
+			// Delete the style tag
+			$style_tag = $css_parser->xpath($doc, '//style', 0);
+			$style_tag->parentNode->removeChild($style_tag);
+
+			// Re-export document
+			$html = $doc->saveHTML($doc->documentElement);
+
+			unset($doc);
+
+			libxml_use_internal_errors(false);
+		}
+
+		return $html;
+	}
+
+	/**
 	 * Add a message to the sending queue using templates
 	 * @param  int          $context
 	 * @param  iterable        $recipients List of recipients, this accepts a wide range of types:
@@ -61,10 +120,10 @@ class Emails
 	 * @param  UserTemplate|string $content
 	 * @return void
 	 */
-	static public function queue(int $context, iterable $recipients, ?string $sender, string $subject, $content, array $attachments = []): void
+	static public function queue(int $context, iterable $recipients, ?string $sender, string $subject, $text, array $attachments = []): ?array
 	{
 		if (DISABLE_EMAIL) {
-			return;
+			return null;
 		}
 
 		foreach ($attachments as $i => $file) {
@@ -134,14 +193,15 @@ class Emails
 		}
 
 		if (!count($list)) {
-			return;
+			return null;
 		}
 
 		$recipients = $list;
 		unset($list);
 
 		$is_system = $context === self::CONTEXT_SYSTEM;
-		$template = (!$is_system && $content instanceof UserTemplate) ? $content : null;
+		$template = (!$is_system && $text instanceof UserTemplate) ? $text : null;
+		$content = $text;
 
 		if ($template) {
 			$template->toggleSafeMode(true);
@@ -152,22 +212,24 @@ class Emails
 
 		// queue handling was done by a plugin, stop here
 		if ($signal && $signal->isStopped()) {
-			return;
+			return $signal->getOut('ids');
 		}
 
 		$db = DB::getInstance();
 		$db->begin();
 		$html = null;
-		$main_tpl = null;
+		$ids = [];
 
-		// Apart from SYSTEM emails, all others should be wrapped in the email.html template
-		if (!$is_system) {
-			$main_tpl = new UserTemplate('web/email.html');
+		$markdown = $context === self::CONTEXT_BULK;
+
+		// If E-Mail does not have placeholders, we can render the MarkDown just once for HTML
+		// this avoids calling the markdown parser for each recipient
+		if ($markdown && !$template) {
+			$html = Render::render(Render::FORMAT_MARKDOWN, null, $text);
+			$content = Render::render(Render::FORMAT_PLAINTEXT, null, $text);
 		}
-
-		if (!$is_system && !$template) {
-			// If E-Mail does not have placeholders, we can render the MarkDown just once for HTML
-			$html = Render::render(Render::FORMAT_MARKDOWN, null, $content);
+		elseif (!$template) {
+			$html = Utils::linkifyURLs(nl2br(htmlspecialchars($text)));
 		}
 
 		foreach ($recipients as $recipient => $r) {
@@ -178,36 +240,38 @@ class Emails
 			// it's done in the queue clearing (more efficient)
 			$recipient_hash = Email::getHash($recipient);
 
-			// Replace placeholders: {{$name}}, etc.
+			// Replace placeholders in template: {{$name}}, etc.
 			if ($template) {
 				$template->assignArray((array) $data, null, false);
 
 				// Disable HTML escaping for plaintext emails
-				$template->setEscapeDefault(null);
+				$template->setEscapeType(null);
 				$content = $template->fetch();
 
-				// Add Markdown rendering
-				$content_html = Render::render(Render::FORMAT_MARKDOWN, null, $content);
+				if ($markdown) {
+					// Render Markdown to HTML
+					$content_html = Render::render(Render::FORMAT_MARKDOWN, null, $content);
+					// Remove markdown code from plaintext email
+					$content = Render::render(Render::FORMAT_PLAINTEXT, null, $content);
+				}
+				else {
+					$content_html = Utils::linkifyURLs(nl2br(htmlspecialchars($content)));
+				}
 			}
 			else {
 				$content_html = $html;
+				$content = $text;
 			}
 
-			if ($context === self::CONTEXT_BULK) {
-				$content_html = self::replaceExternalLinksInHTML($content_html);
-			}
-
+			// System emails are sent as plaintext
+			// but personal messages, reminders, and mailings are sent wrapped in the
+			// global HTML template
 			if (!$is_system) {
-				// Wrap HTML content in the email skeleton
-				$main_tpl->assignArray([
-					'html'      => $content_html,
-					'address'   => $recipient,
-					'data'      => $data,
-					'context'   => $context,
-					'from'      => $sender,
-				]);
+				if ($context === self::CONTEXT_BULK) {
+					$content_html = self::replaceExternalLinksInHTML($content_html);
+				}
 
-				$content_html = $main_tpl->fetch();
+				$content_html = self::applyHTMLTemplate($content_html);
 			}
 
 			$signal = Plugins::fire('email.queue.insert', true,
@@ -222,15 +286,39 @@ class Emails
 
 			$db->insert('emails_queue', compact('sender', 'subject', 'context', 'recipient', 'recipient_pgp_key', 'recipient_hash', 'content', 'content_html'));
 
-			// Clean up memory
-			unset($content_html);
-
 			$id = $db->lastInsertId();
 
 			foreach ($attachments as $file) {
 				$db->insert('emails_queue_attachments', ['id_queue' => $id, 'path' => $file->path]);
 			}
+
+			$ids[] = $id;
 		}
+
+		// Use the last recipient content to forward to MAIL_TEST_RECIPIENTS, just change the recipient
+		if (MAIL_TEST_RECIPIENTS
+			&& ($context === self::CONTEXT_BULK || $context === self::CONTEXT_NOTIFICATION || $context === self::CONTEXT_REMINDER)
+			&& count($ids)) {
+			$recipient_pgp_key = null;
+
+			foreach (MAIL_TEST_RECIPIENTS as $recipient) {
+				$recipient_hash = Email::getHash($recipient);
+				$signal = Plugins::fire('email.queue.insert', true,
+					compact('context', 'recipient', 'sender', 'subject', 'content', 'recipient_hash', 'recipient_pgp_key', 'content_html', 'attachments'));
+
+				if ($signal && $signal->isStopped()) {
+					// queue insert was done by a plugin, stop here
+					continue;
+				}
+
+				unset($signal);
+
+				$db->insert('emails_queue', compact('sender', 'subject', 'context', 'recipient', 'recipient_pgp_key', 'recipient_hash', 'content', 'content_html'));
+			}
+		}
+
+		// Clean up memory
+		unset($content_html);
 
 		$db->commit();
 
@@ -238,7 +326,7 @@ class Emails
 			compact('context', 'recipients', 'sender', 'subject', 'content', 'attachments'));
 
 		if ($signal && $signal->isStopped()) {
-			return;
+			return $ids;
 		}
 
 		// If no crontab is used, then the queue should be run now
@@ -249,6 +337,8 @@ class Emails
 		elseif ($is_system) {
 			self::runQueue(self::CONTEXT_SYSTEM);
 		}
+
+		return $ids;
 	}
 
 	/**
@@ -337,7 +427,6 @@ class Emails
 		$count = 0;
 		$all_attachments = [];
 
-		// listQueue nettoie déjà la queue
 		foreach ($queue as $row) {
 			// See if we need to avoid this recipient
 			if (!Email::acceptsThisMessage($row)) {
@@ -382,6 +471,11 @@ class Emails
 				'Subject' => $row->subject,
 			];
 
+			if (MAIL_TEST_RECIPIENTS
+				&& in_array($row->recipient, MAIL_TEST_RECIPIENTS, true)) {
+				$headers['X-Is-Recipient'] = 'Yes';
+			}
+
 			try {
 				$attachments = $db->getAssoc('SELECT id, path FROM emails_queue_attachments WHERE id_queue = ?;', $row->id);
 				$all_attachments = array_merge($all_attachments, $attachments);
@@ -413,14 +507,13 @@ class Emails
 		// Update emails list and send count
 		// then delete messages from queue
 		$db->begin();
-		$db->exec(sprintf('
-			UPDATE emails_queue SET sending = 2 WHERE %s;
-			INSERT OR IGNORE INTO %s (hash) SELECT recipient_hash FROM emails_queue WHERE sending = 2;
-			UPDATE %2$s SET sent_count = sent_count + 1, last_sent = datetime()
-				WHERE hash IN (SELECT recipient_hash FROM emails_queue WHERE sending = 2);
-			DELETE FROM emails_queue WHERE sending = 2;',
-			$db->where('id', $ids),
-			Email::TABLE));
+		$db->exec(sprintf('UPDATE emails_queue SET sending = 2 WHERE %s;', $db->where('id', $ids)));
+		$db->exec(sprintf('INSERT OR IGNORE INTO %s (hash) SELECT recipient_hash FROM emails_queue WHERE sending = 2;', Email::TABLE));
+		$sql = sprintf('UPDATE %s SET sent_count = sent_count + 1, last_sent = ?
+				WHERE hash IN (SELECT recipient_hash FROM emails_queue WHERE sending = 2);',
+			Email::TABLE);
+		$db->preparedQuery($sql, new \DateTime);
+		$db->exec('DELETE FROM emails_queue WHERE sending = 2;');
 		$db->commit();
 
 		$unused_attachments = array_diff($all_attachments, $db->getAssoc('SELECT id, path FROM emails_queue_attachments;'));
@@ -471,9 +564,6 @@ class Emails
 	 */
 	static protected function listQueue(?int $context = null): array
 	{
-		// Clean-up the queue from reject emails
-		self::purgeQueueFromRejected();
-
 		// Reset messages that failed during the queue run
 		self::resetFailed();
 
@@ -489,19 +579,6 @@ class Emails
 	static public function countQueue(): int
 	{
 		return DB::getInstance()->count('emails_queue');
-	}
-
-	/**
-	 * Supprime de la queue les messages liés à des adresses invalides
-	 * ou qui ne souhaitent plus recevoir de message
-	 * @return boolean
-	 */
-	static protected function purgeQueueFromRejected(): void
-	{
-		DB::getInstance()->delete('emails_queue',
-			'recipient_hash IN (SELECT hash FROM emails WHERE (invalid = 1 OR fail_count >= ?)
-			AND last_sent >= datetime(\'now\', \'-1 month\'));',
-			self::FAIL_LIMIT);
 	}
 
 	/**
@@ -610,10 +687,13 @@ class Emails
 			. "Pour ne plus recevoir ces messages cliquez ici :\n";
 	}
 
+	/**
+	 * @see https://www.nngroup.com/articles/unsubscribe-mistakes/
+	 */
 	static public function appendHTMLOptoutFooter(string $html, string $url): string
 	{
-		$footer = '<p style="color: #666; background: #fff; padding: 10px; text-align: center; font-size: 9pt">' . nl2br(htmlspecialchars(self::getOptoutText()));
-		$footer .= sprintf('<br /><a href="%s" style="color: #009; text-decoration: underline; padding: 5px 10px; border-radius: 5px; background: #eee; border: 1px outset #ccc;">Me désinscrire</a></p>', $url);
+		$footer = '<p style="color: #666; background: #fff; padding: 10px; margin: 50px auto 0 auto; max-width: 700px; border-top: 1px solid #ccc; text-align: center; font-size: 9pt">' . nl2br(htmlspecialchars(trim(self::getOptoutText())));
+		$footer .= sprintf('<br /><a href="%s" style="color: #009; text-decoration: underline;">Me désinscrire</a></p>', $url);
 
 		if (stripos($html, '</body>') !== false) {
 			$html = str_ireplace('</body>', $footer . '</body>', $html);
@@ -641,6 +721,10 @@ class Emails
 		}
 
 		$message->setMessageId();
+
+		if ($headers['X-Is-Recipient'] ?? null === 'Yes') {
+			$message->setMessageId('pko.' . $message->getMessageId());
+		}
 
 		// Append unsubscribe, except for password reminders
 		if ($context != self::CONTEXT_SYSTEM) {
@@ -703,6 +787,13 @@ class Emails
 
 		if (SMTP_HOST) {
 			static $smtp = null;
+			static $count = 0;
+
+			// Reset connection when we reach the max number of messages
+			if (null !== $smtp && $count >= SMTP_MAX_MESSAGES_PER_SESSION) {
+				$smtp->disconnect();
+				$smtp = null;
+			}
 
 			// Re-use SMTP connection in queues
 			if (null === $smtp) {
@@ -715,6 +806,7 @@ class Emails
 			try {
 				$return = $smtp->send($message);
 				// TODO: store return message from SMTP server
+				$count++;
 			}
 			catch (SMTP_Exception $e) {
 				// Handle invalid recipients addresses
@@ -776,17 +868,19 @@ class Emails
 			// Ignore auto-responders
 			return $return;
 		}
-		elseif ($return['type'] === 'genuine') {
+		elseif ($return['type'] === 'genuine'
+			|| $return['type'] === 'captcha') {
 			// Forward emails that are not automatic to the organization email
 			$config = Config::getInstance();
 
 			$new = new Mail_Message;
 			$new->setHeaders([
 				'To'      => $config->org_email,
-				'Subject' => 'Réponse à un message que vous avez envoyé',
+				'Subject' => 'Fw: ' . $message->getHeader('Subject'),
+				'From'    => self::getFromHeader(),
 			]);
 
-			$new->setBody('Veuillez trouver ci-joint une réponse à un message que vous avez envoyé à un de vos membre.');
+			$new->setBody('Veuillez trouver ci-joint un message reçu à l\'attention de votre association.');
 
 			$new->attachMessage($message->output());
 

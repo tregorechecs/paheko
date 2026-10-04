@@ -30,7 +30,7 @@ if (!defined('Paheko\CONFIG_FILE')) {
 require_once __DIR__ . '/lib/KD2/ErrorManager.php';
 
 ErrorManager::enable(ErrorManager::DEVELOPMENT);
-ErrorManager::setLogFile(__DIR__ . '/data/error.log');
+ErrorManager::setLogFile(__DIR__ . '/../data/error.log');
 
 /*
  * Version de Paheko
@@ -176,6 +176,7 @@ static $default_config = [
 	// have a config.local.php for OS-specific stuff, this also allows
 	// to remove LOCAL_USER and have a multi-user setup on a single computer
 	'DESKTOP_CONFIG_FILE'   => null,
+	'BACKUPS_ROOT'          => DATA_ROOT . '/backups',
 	'CACHE_ROOT'            => DATA_ROOT . '/cache',
 	'SHARED_CACHE_ROOT'     => DATA_ROOT . '/cache/shared',
 	'WEB_CACHE_ROOT'        => DATA_ROOT . '/cache/web/%host%',
@@ -205,9 +206,11 @@ static $default_config = [
 	'SMTP_PORT'             => 587,
 	'SMTP_SECURITY'         => 'NONE',
 	'SMTP_HELO_HOSTNAME'    => null,
+	'SMTP_MAX_MESSAGES_PER_SESSION' => 50,
 	'MAIL_RETURN_PATH'      => null,
 	'MAIL_BOUNCE_PASSWORD'  => null,
 	'MAIL_SENDER'           => null,
+	'MAIL_TEST_RECIPIENTS'  => null,
 	'ADMIN_URL'             => WWW_URL . 'admin/',
 	'ADMIN_COLOR1'          => '#20787a',
 	'ADMIN_COLOR2'          => '#85b9ba',
@@ -234,6 +237,8 @@ static $default_config = [
 	'OIDC_CLIENT_SECRET'    => null,
 	'OIDC_CLIENT_MATCH_EMAIL' => true,
 	'OIDC_CLIENT_DEFAULT_PERMISSIONS' => null,
+	'OIDC_CLIENT_CALLBACK'  => null,
+	'ENABLE_PERMISSIONS'    => true,
 	'LEGAL_HOSTING_DETAILS' => null,
 	'ALERT_MESSAGE'         => null,
 	'DISABLE_INSTALL_PING'  => false,
@@ -332,6 +337,7 @@ if (OPEN_BASEDIR && PHP_SAPI !== 'cli') {
 			// Same with modules
 			ROOT . '/modules',
 			DATA_ROOT,
+			BACKUPS_ROOT,
 			CACHE_ROOT,
 			SHARED_CACHE_ROOT,
 			PLUGINS_ROOT,
@@ -339,7 +345,13 @@ if (OPEN_BASEDIR && PHP_SAPI !== 'cli') {
 			LOCAL_ADDRESSES_ROOT,
 			sys_get_temp_dir(),
 		]);
+
+		if (FILE_STORAGE_BACKEND === 'FileSystem') {
+			$paths[] = FILE_STORAGE_CONFIG;
+		}
 	}
+
+	$paths = array_filter($paths);
 
 	foreach ($paths as &$path) {
 		// Make sure the path exists, or errors might be returned
@@ -379,6 +391,10 @@ class ValidationException extends UserException
 }
 
 class APIException extends \LogicException
+{
+}
+
+class TemplateException extends \RuntimeException
 {
 }
 

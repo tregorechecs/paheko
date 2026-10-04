@@ -38,7 +38,7 @@
 {if $session->canAccess($session::SECTION_ACCOUNTING, $session::ACCESS_WRITE) && $transaction->isWaiting()}
 <div class="block alert">
 	<form method="post" action="{$self_url}">
-	{if $transaction.type == $transaction::TYPE_DEBT}
+	{if $transaction->getPayoffKind() == $transaction::TYPE_DEBT}
 		<h3>Dette en attente</h3>
 		{linkbutton shape="check" label="Régler cette dette" href="!acc/transactions/new.php?payoff=%d"|args:$transaction.id}
 	{else}
@@ -74,7 +74,7 @@
 			<dd><span class="alert">{icon shape="lock"} Écriture verrouillée</span></dd>
 		{/if}
 
-			{if $transaction.type == $transaction::TYPE_DEBT || $transaction.type == $transaction::TYPE_CREDIT}
+			{if $transaction->getPayoffKind()}
 				<dt>Statut</dt>
 				<dd>
 					{if $transaction->isPaid()}
@@ -177,6 +177,7 @@
 						<td>Libellé ligne</td>
 						<td>Référence ligne</td>
 						<td>Projet</td>
+						<td></td>
 					</tr>
 				</thead>
 				<tbody>
@@ -191,6 +192,11 @@
 						<td>
 							{if $line.id_project}
 								{link href="!acc/reports/statement.php?project=%d&year=%d"|args:$line.id_project:$transaction.id_year label=$line.project_name}
+							{/if}
+						</td>
+						<td>
+							{if $line.is_deposited}
+								{tag label="Déposé" color="lightseagreen"}
 							{/if}
 						</td>
 					</tr>

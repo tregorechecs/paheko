@@ -47,24 +47,22 @@ if ((empty($uri) || $uri === '/') && !empty($_GET['un'])) {
 	$params['h'] = $params['un'];
 	unset($params['un']);
 
-	$params = array_filter($params);
+	$params = array_filter($params, fn($a) => !is_null($a));
 
 	// RFC 8058
 	if (!empty($_POST['Unsubscribe']) && $_POST['Unsubscribe'] == 'Yes') {
-		$email = Emails::getEmailFromOptout($params['h']);
+		$email = Emails::getEmailFromQueryStringValue($params['h']);
 
 		if (!$email) {
 			throw new UserException('Adresse email introuvable.');
 		}
 
-		$email->setOptout((int) $params['c']);
+		$context = $params['c'] ?? null;
+		$email->setOptout($context ? (int) $context : null);
 		$email->save();
 		http_response_code(200);
 		echo 'Unsubscribe successful';
 		return;
-	}
-	elseif (!empty($params['y'])) {
-		Utils::redirect('!email_verify.php?' . http_build_query($params));
 	}
 	else {
 		Utils::redirect('!email_preferences.php?' . http_build_query($params));

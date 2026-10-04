@@ -59,13 +59,16 @@ class Transactions
 		$db->begin();
 
 		try {
-			$ids = [];
+			$transactions_ids = [];
+			$lines_ids = [];
+
 			foreach ($journal as $row) {
-				if (!array_key_exists($row->id_line, $checked)) {
+				if (!in_array($row->id_line, $checked)) {
 					continue;
 				}
 
-				$ids[] = (int)$row->id;
+				$transactions_ids[] = (int)$row->id;
+				$lines_ids[] = $row->id_line;
 
 				$line = new Line;
 				$line->importForm([
@@ -81,9 +84,8 @@ class Transactions
 			}
 
 			$transaction->save();
-			$transaction->updateLinkedTransactions($ids);
-			$ids = implode(',', $ids);
-			$db->exec(sprintf('UPDATE acc_transactions SET status = (status | %d) WHERE id IN (%s);', Transaction::STATUS_DEPOSITED, $ids));
+			$transaction->updateLinkedTransactions($transactions_ids);
+			$account->markLinesAsDeposited($lines_ids);
 			$db->commit();
 		}
 		catch (\Exception $e) {
@@ -153,7 +155,6 @@ class Transactions
 
 		$list = new DynamicList($columns, $tables, $conditions);
 		$list->orderBy('date', true);
-		$list->setCount('COUNT(DISTINCT t.id)');
 		$list->groupBy('t.id');
 		$list->setModifier(function (&$row) {
 			$row->date = \DateTime::createFromFormat('!Y-m-d', $row->date);
@@ -211,19 +212,72 @@ class Transactions
 			unset($columns['locked']);
 		}
 
-		$columns['line_reference']['label'] = 'Réf. paiement';
+		$types_with_ref = [
+			Transaction::TYPE_REVENUE,
+			Transaction::TYPE_EXPENSE,
+			Transaction::TYPE_TRANSFER,
+		];
+
+		if (in_array($type, $types_with_ref)) {
+			$columns['line_reference']['label'] = 'Réf. paiement';
+		}
+		else {
+			unset($columns['line_reference']);
+		}
+
 		$columns['change']['select'] = sprintf('SUM(l.credit) * %d', $reverse);
 		$columns['change']['label'] = 'Montant';
 		$columns['project_code']['select'] = 'json_group_array(IFNULL(b.code, SUBSTR(b.label, 1, 10) || \'…\'))';
 		$columns['id_project']['select'] = 'json_group_array(b.id)';
 
-		if ($type == Transaction::TYPE_CREDIT || $type == Transaction::TYPE_DEBT) {
+		// Unique 41x third-party line on advanced entries → créance (debit) or dette (credit).
+		// Exclude settlements that also touch a class 5 financial account.
+		$advanced_41_count = '(SELECT COUNT(*) FROM acc_transactions_lines AS l41
+			INNER JOIN acc_accounts AS a41 ON a41.id = l41.id_account
+			WHERE l41.id_transaction = t.id AND a41.code LIKE \'41%\')';
+		$advanced_41_debit = '(SELECT l41.debit FROM acc_transactions_lines AS l41
+			INNER JOIN acc_accounts AS a41 ON a41.id = l41.id_account
+			WHERE l41.id_transaction = t.id AND a41.code LIKE \'41%\' LIMIT 1)';
+		$advanced_financial_count = '(SELECT COUNT(*) FROM acc_transactions_lines AS l5
+			INNER JOIN acc_accounts AS a5 ON a5.id = l5.id_account
+			WHERE l5.id_transaction = t.id AND a5.code LIKE \'5%\')';
+		$payoff_kind_sql = sprintf(
+			'CASE
+				WHEN t.type IN (%d, %d) THEN t.type
+				WHEN t.type = %d AND (%s) = 1 AND (%s) = 0 THEN CASE WHEN (%s) > 0 THEN %d ELSE %d END
+				ELSE NULL
+			END',
+			Transaction::TYPE_CREDIT,
+			Transaction::TYPE_DEBT,
+			Transaction::TYPE_ADVANCED,
+			$advanced_41_count,
+			$advanced_financial_count,
+			$advanced_41_debit,
+			Transaction::TYPE_CREDIT,
+			Transaction::TYPE_DEBT
+		);
 
+		$columns['payoff_kind'] = [
+			'select' => $payoff_kind_sql,
+		];
+
+		if ($type == Transaction::TYPE_CREDIT || $type == Transaction::TYPE_DEBT || $type === Transaction::TYPE_ADVANCED) {
 			$columns['status_label'] = [
 				'label' => 'Statut',
-				'select' => sprintf('CASE WHEN t.status & %d THEN %s WHEN t.status & %d THEN %s ELSE NULL END',
-					Transaction::STATUS_WAITING, $db->quote('En attente'),
-					Transaction::STATUS_PAID, $db->quote('Réglée')
+				'select' => sprintf(
+					'CASE
+						WHEN t.status & %d THEN %s
+						WHEN (%s) IS NOT NULL AND (
+							(t.type IN (%d, %d) AND t.status & %d)
+							OR (t.type = %d AND NOT (t.status & %d))
+						) THEN %s
+						ELSE NULL
+					END',
+					Transaction::STATUS_PAID, $db->quote('Réglée'),
+					$payoff_kind_sql,
+					Transaction::TYPE_CREDIT, Transaction::TYPE_DEBT, Transaction::STATUS_WAITING,
+					Transaction::TYPE_ADVANCED, Transaction::STATUS_PAID,
+					$db->quote('En attente')
 				),
 			];
 		}
@@ -242,14 +296,17 @@ class Transactions
 			LEFT JOIN acc_projects b ON b.id = l.id_project';
 		$conditions = sprintf('t.id_year = %d', $year_id);
 
-		if (null !== $type) {
+		if ($type === Transaction::TYPE_CREDIT || $type === Transaction::TYPE_DEBT) {
+			// Include matching advanced entries with a single 41x line
+			$conditions .= sprintf(' AND (%s) = %d', $payoff_kind_sql, $type);
+		}
+		elseif (null !== $type) {
 			$conditions .= sprintf(' AND t.type = %s', $type);
 		}
 
 
 		$list = new DynamicList($columns, $tables, $conditions);
 		$list->orderBy('date', true);
-		$list->setCount('COUNT(t.id)');
 		$list->setCountTables('acc_transactions t');
 		$list->groupBy('t.id');
 		$list->setModifier(function (&$row) {
@@ -328,11 +385,13 @@ class Transactions
 				throw new UserException('Écriture inconnue : ' . $id);
 			}
 
-			if (!$t->hasStatus(Transaction::STATUS_WAITING)) {
+			if (!$t->isWaiting()) {
 				continue;
 			}
 
-			if ($t->type !== Transaction::TYPE_CREDIT && $t->type !== Transaction::TYPE_DEBT) {
+			$payoff_kind = $t->getPayoffKind();
+
+			if ($payoff_kind !== Transaction::TYPE_CREDIT && $payoff_kind !== Transaction::TYPE_DEBT) {
 				continue;
 			}
 
@@ -346,16 +405,27 @@ class Transactions
 			}
 
 			if ($out->type === null) {
-				$out->type = $t->type;
+				$out->type = $payoff_kind;
 			}
-			elseif ($out->type !== $t->type) {
+			elseif ($out->type !== $payoff_kind) {
 				throw new UserException('Il n\'est pas possible de régler à la fois des créances et des dettes');
 			}
 
 			$id_project = $t->getProjectId();
 			$out->id_project = $id_project;
 
-			$sum = $t->sum();
+			if ($t->type === Transaction::TYPE_ADVANCED) {
+				$third_party_line = $t->getSingleThirdParty41Line();
+				$sum = $third_party_line->debit ?: $third_party_line->credit;
+				$id_account = $third_party_line->id_account;
+			}
+			else {
+				$sum = $t->sum();
+				$id_account = $out->type === Transaction::TYPE_CREDIT
+					? $t->getDebitLine()->id_account
+					: $t->getCreditLine()->id_account;
+			}
+
 			$out->amount += $sum;
 			$out->linked_transactions[] = $t->id;
 
@@ -372,11 +442,9 @@ class Transactions
 
 			if ($out->type === Transaction::TYPE_CREDIT) {
 				$line->credit = $sum;
-				$id_account = $t->getDebitLine()->id_account;
 			}
 			else {
 				$line->debit = $sum;
-				$id_account = $t->getCreditLine()->id_account;
 			}
 
 			// Make sure account ID is valid for this chart
